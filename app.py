@@ -23,8 +23,8 @@ MAX_WORKERS = 100
 MAX_RETRIES = 3
 TIMEOUT = 20
 
-TOTAL_BATCHES = os.getenv("BATCH_NUM",1)
-BATCH_NO = 1          # 👈 CHANGE THIS (1-based index)
+TOTAL_BATCHES = 10
+BATCH_NO = os.getenv("BATCH_NUM",1)         # 👈 CHANGE THIS (1-based index)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 0)
@@ -99,6 +99,16 @@ def fetch_candles(symbol: str, start_ms: int, end_ms: int):
                 return []
 
             time.sleep(1)
+# =====================================================
+# HOME / HEALTH CHECK
+# =====================================================
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "ok",
+        "message": "Server running fine 🚀",
+        "time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+    })
 
 # =====================================================
 # API
