@@ -1,4 +1,4 @@
-import json,os
+import json, os
 import time
 import requests
 from datetime import datetime, timedelta, timezone, time as dtime
@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, jsonify, request
 from flask_compress import Compress
-from flask_cors import CORS   # ✅ ADDED
+from flask_cors import CORS
 
 # =====================================================
 # CONFIG
@@ -24,7 +24,7 @@ MAX_RETRIES = 3
 TIMEOUT = 20
 
 TOTAL_BATCHES = 10
-BATCH_NO = int(os.getenv("BATCH_NUM",1))        # 👈 CHANGE THIS (1-based index)
+BATCH_NO = int(os.getenv("BATCH_NUM", 1))
 
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 0)
@@ -35,7 +35,7 @@ MARKET_CLOSE = dtime(15, 30)
 # =====================================================
 app = Flask(__name__)
 Compress(app)
-CORS(app, resources={r"/api/*": {"origins": "*"}})   # ✅ ADDED
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # =====================================================
 # TIME HELPERS
@@ -60,6 +60,14 @@ def market_range_for_date(date_str: str | None):
     else:
         end = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
+    return to_ms(start), to_ms(end)
+
+
+# ✅ NEW (only addition)
+def latest_candle_range():
+    now = datetime.now(IST)
+    end = now
+    start = now - timedelta(minutes=INTERVAL_MINUTES)
     return to_ms(start), to_ms(end)
 
 # =====================================================
@@ -90,17 +98,16 @@ def fetch_candles(symbol: str, start_ms: int, end_ms: int):
                 timeout=TIMEOUT,
             )
             r.raise_for_status()
-
             data = r.json()
             return data.get("candles", [])
 
         except Exception:
             if attempt == MAX_RETRIES:
                 return []
-
             time.sleep(1)
+
 # =====================================================
-# HOME / HEALTH CHECK
+# HOME
 # =====================================================
 @app.route("/", methods=["GET"])
 def home():
@@ -115,7 +122,8 @@ def home():
 # =====================================================
 @app.route("/api/live-candles", methods=["GET"])
 def live_candles():
-    date = request.args.get("date")  # YYYY-MM-DD optional
+    date = request.args.get("date")
+    latest = request.args.get("latest", "false").lower() == "true"
 
     with open(COMPANY_FILE, "r") as f:
         data = json.load(f)
@@ -131,7 +139,10 @@ def live_candles():
 
     batch = data[start_idx:end_idx]
 
-    start_ms, end_ms = market_range_for_date(date)
+    if latest:
+        start_ms, end_ms = latest_candle_range()
+    else:
+        start_ms, end_ms = market_range_for_date(date)
 
     results = {}
 
@@ -146,9 +157,26 @@ def live_candles():
 
         for future in as_completed(futures):
             symbol = futures[future]
-            results[symbol] = future.result()
+            candles = future.result()
+
+            if latest:
+                if candles:
+                    ts, o, h, l, c, v = candles[-1]
+                    results[symbol] = {
+                        "time": datetime.fromtimestamp(ts / 1000, IST).strftime("%H:%M:%S"),
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                    }
+                else:
+                    results[symbol] = None
+            else:
+                results[symbol] = candles
 
     return jsonify({
+        "mode": "latest" if latest else "full",
         "batch_no": batch_no,
         "total_batches": max_batch_no,
         "date": date or datetime.now(IST).strftime("%Y-%m-%d"),
