@@ -1,4 +1,4 @@
-import json,os
+import json, os
 import time
 import requests
 from datetime import datetime, timedelta, timezone, time as dtime
@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, jsonify, request
 from flask_compress import Compress
-from flask_cors import CORS   # ✅ ADDED
+from flask_cors import CORS
 
 # =====================================================
 # CONFIG
@@ -24,18 +24,20 @@ MAX_RETRIES = 3
 TIMEOUT = 20
 
 TOTAL_BATCHES = 10
-BATCH_NO = int(os.getenv("BATCH_NUM",1))        # 👈 CHANGE THIS (1-based index)
+BATCH_NO = int(os.getenv("BATCH_NUM", 1))
 
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 0)
 MARKET_CLOSE = dtime(15, 30)
+
+MAX_LOOKBACK_DAYS = 7   # ⬅ safety limit
 
 # =====================================================
 # FLASK
 # =====================================================
 app = Flask(__name__)
 Compress(app)
-CORS(app, resources={r"/api/*": {"origins": "*"}})   # ✅ ADDED
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # =====================================================
 # TIME HELPERS
@@ -44,23 +46,46 @@ def to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def market_range_for_date(date_str: str | None):
+def market_range_for_date(date_str: str):
+    d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=IST)
+    start = d.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = d.replace(hour=15, minute=30, second=0, microsecond=0)
+    return to_ms(start), to_ms(end)
+
+
+def effective_trade_date(requested_date: str | None):
+    """
+    Determines the first valid trading date with available data.
+    Falls back over holidays/weekends automatically.
+    """
     now = datetime.now(IST)
 
-    if date_str:
-        d = datetime.strptime(date_str, "%Y-%m-%d")
-        start = d.replace(hour=9, minute=0, tzinfo=IST)
-        end = d.replace(hour=15, minute=30, tzinfo=IST)
-        return to_ms(start), to_ms(end)
-
-    start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-
-    if now.time() < MARKET_CLOSE:
-        end = now
+    if requested_date:
+        base_date = datetime.strptime(requested_date, "%Y-%m-%d")
     else:
-        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        # Before market open → start from yesterday
+        if now.time() < MARKET_OPEN:
+            base_date = now - timedelta(days=1)
+        else:
+            base_date = now
 
-    return to_ms(start), to_ms(end)
+    for i in range(MAX_LOOKBACK_DAYS):
+        check_date = (base_date - timedelta(days=i)).strftime("%Y-%m-%d")
+        start_ms, end_ms = market_range_for_date(check_date)
+
+        # Try one symbol just to confirm market data exists
+        try:
+            with open(COMPANY_FILE) as f:
+                sample_symbol = json.load(f)[0].split("__")[0].strip()
+
+            candles = fetch_candles(sample_symbol, start_ms, end_ms)
+            if candles:
+                return check_date, i > 0
+        except Exception:
+            pass
+
+    # Fallback: return base date even if empty
+    return base_date.strftime("%Y-%m-%d"), True
 
 # =====================================================
 # FETCH LOGIC
@@ -90,17 +115,14 @@ def fetch_candles(symbol: str, start_ms: int, end_ms: int):
                 timeout=TIMEOUT,
             )
             r.raise_for_status()
-
-            data = r.json()
-            return data.get("candles", [])
-
+            return r.json().get("candles", [])
         except Exception:
             if attempt == MAX_RETRIES:
                 return []
-
             time.sleep(1)
+
 # =====================================================
-# HOME / HEALTH CHECK
+# HOME
 # =====================================================
 @app.route("/", methods=["GET"])
 def home():
@@ -115,45 +137,62 @@ def home():
 # =====================================================
 @app.route("/api/live-candles", methods=["GET"])
 def live_candles():
-    date = request.args.get("date")  # YYYY-MM-DD optional
+    requested_date = request.args.get("date")
+    latest = request.args.get("latest", "false").lower() == "true"
 
-    with open(COMPANY_FILE, "r") as f:
-        data = json.load(f)
+    fetched_date, is_fallback = effective_trade_date(requested_date)
+    start_ms, end_ms = market_range_for_date(fetched_date)
 
-    total_items = len(data)
+    with open(COMPANY_FILE) as f:
+        companies = json.load(f)
+
+    total_items = len(companies)
     batch_size = max(1, total_items // TOTAL_BATCHES)
 
-    max_batch_no = (total_items + batch_size - 1) // batch_size
-    batch_no = min(BATCH_NO, max_batch_no)
-
+    batch_no = min(BATCH_NO, (total_items + batch_size - 1) // batch_size)
     start_idx = (batch_no - 1) * batch_size
     end_idx = min(start_idx + batch_size, total_items)
 
-    batch = data[start_idx:end_idx]
-
-    start_ms, end_ms = market_range_for_date(date)
-
+    batch = companies[start_idx:end_idx]
     results = {}
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {}
-
-        for item in batch:
-            symbol = item.split("__")[0].strip()
-            futures[
-                executor.submit(fetch_candles, symbol, start_ms, end_ms)
-            ] = symbol
+        futures = {
+            executor.submit(
+                fetch_candles,
+                item.split("__")[0].strip(),
+                start_ms,
+                end_ms
+            ): item.split("__")[0].strip()
+            for item in batch
+        }
 
         for future in as_completed(futures):
             symbol = futures[future]
-            results[symbol] = future.result()
+            candles = future.result()
+
+            if latest:
+                if candles:
+                    ts, o, h, l, c, v = candles[-1]
+                    results[symbol] = {
+                        "time": datetime.fromtimestamp(ts / 1000, IST).strftime("%H:%M:%S"),
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                    }
+                else:
+                    results[symbol] = None
+            else:
+                results[symbol] = candles
 
     return jsonify({
+        "mode": "latest" if latest else "full",
+        "requested_date": requested_date,
+        "fetched_date": fetched_date,
+        "is_fallback": is_fallback,
         "batch_no": batch_no,
-        "total_batches": max_batch_no,
-        "date": date or datetime.now(IST).strftime("%Y-%m-%d"),
-        "start_ms": start_ms,
-        "end_ms": end_ms,
         "interval_minutes": INTERVAL_MINUTES,
         "count": len(results),
         "data": results,
