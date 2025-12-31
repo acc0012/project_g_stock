@@ -243,7 +243,7 @@ def analyze_signals():
         }
 
     elapsed = time.perf_counter() - start_clock
-
+ 
     return jsonify({
         "status": "ok",
         "batch_no": batch_no,
