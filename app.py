@@ -14,7 +14,7 @@ from flask_cors import CORS
 COMPANY_FILE = "companies_list.json"
 
 GROWW_URL = (
-    "https://groww.in/v1/api/charting_service/v2/chart/"
+    "https://groww.in/v1/api/charting_service/v2/charting_service/v2/chart/"
     "delayed/exchange/NSE/segment/CASH"
 )
 
@@ -30,7 +30,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 0)
 MARKET_CLOSE = dtime(15, 30)
 
-MAX_LOOKBACK_DAYS = 7   # ⬅ safety limit
+MAX_LOOKBACK_DAYS = 7
 
 # =====================================================
 # FLASK
@@ -54,16 +54,11 @@ def market_range_for_date(date_str: str):
 
 
 def effective_trade_date(requested_date: str | None):
-    """
-    Determines the first valid trading date with available data.
-    Falls back over holidays/weekends automatically.
-    """
     now = datetime.now(IST)
 
     if requested_date:
         base_date = datetime.strptime(requested_date, "%Y-%m-%d")
     else:
-        # Before market open → start from yesterday
         if now.time() < MARKET_OPEN:
             base_date = now - timedelta(days=1)
         else:
@@ -73,7 +68,6 @@ def effective_trade_date(requested_date: str | None):
         check_date = (base_date - timedelta(days=i)).strftime("%Y-%m-%d")
         start_ms, end_ms = market_range_for_date(check_date)
 
-        # Try one symbol just to confirm market data exists
         try:
             with open(COMPANY_FILE) as f:
                 sample_symbol = json.load(f)[0].split("__")[0].strip()
@@ -84,7 +78,6 @@ def effective_trade_date(requested_date: str | None):
         except Exception:
             pass
 
-    # Fallback: return base date even if empty
     return base_date.strftime("%Y-%m-%d"), True
 
 # =====================================================
@@ -108,12 +101,7 @@ def fetch_candles(symbol: str, start_ms: int, end_ms: int):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=TIMEOUT,
-            )
+            r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
             r.raise_for_status()
             return r.json().get("candles", [])
         except Exception:
@@ -172,18 +160,24 @@ def live_candles():
             candles = future.result()
 
             if latest:
-                if candles:
-                    ts, o, h, l, c, v = candles[-1]
-                    results[symbol] = {
-                        "time": datetime.fromtimestamp(ts / 1000, IST).strftime("%H:%M:%S"),
+                last_4 = candles[-4:] if len(candles) >= 4 else candles
+                labeled = []
+
+                for ts, o, h, l, c, v in last_4:
+                    start = datetime.fromtimestamp(ts / 1000, IST)
+                    end = start + timedelta(minutes=INTERVAL_MINUTES)
+
+                    labeled.append({
+                        "start_time": start.strftime("%H:%M:%S"),
+                        "end_time": end.strftime("%H:%M:%S"),
                         "open": o,
                         "high": h,
                         "low": l,
                         "close": c,
                         "volume": v,
-                    }
-                else:
-                    results[symbol] = None
+                    })
+
+                results[symbol] = {"candles": labeled} if labeled else None
             else:
                 results[symbol] = candles
 
