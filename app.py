@@ -1,10 +1,8 @@
-import json, os
-import time
-import requests
+import json, os, time, asyncio
 from datetime import datetime, timedelta, timezone, time as dtime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from flask import Flask, jsonify, request
+import aiohttp
+from flask import Flask, jsonify
 from flask_compress import Compress
 from flask_cors import CORS
 
@@ -18,11 +16,10 @@ GROWW_URL = (
     "delayed/exchange/NSE/segment/CASH"
 )
 
-INTERVAL_MINUTES = 3          # candle interval from Groww
-LATEST_WINDOW_MINUTES = 5     # 👈 NEW LOGIC: last 5 minutes
+SIGNALS_URL = "https://project-get-entry.vercel.app/api/signals"
 
+INTERVAL_MINUTES = 3
 MAX_WORKERS = 100
-MAX_RETRIES = 3
 TIMEOUT = 20
 
 TOTAL_BATCHES = 10
@@ -30,9 +27,6 @@ BATCH_NO = int(os.getenv("BATCH_NUM", 1))
 
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 0)
-MARKET_CLOSE = dtime(15, 30)
-
-MAX_LOOKBACK_DAYS = 7
 
 # =====================================================
 # FLASK
@@ -44,69 +38,23 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # =====================================================
 # TIME HELPERS
 # =====================================================
-def to_ms(dt: datetime) -> int:
+def to_ms(dt):
     return int(dt.timestamp() * 1000)
 
-
-def market_range_for_date(date_str: str):
-    d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=IST)
-    start = d.replace(hour=9, minute=0, second=0, microsecond=0)
-    end = d.replace(hour=15, minute=30, second=0, microsecond=0)
-    return to_ms(start), to_ms(end)
-
-
-def candle_time_range(candles):
-    """
-    Groww candle timestamps are in SECONDS
-    """
-    if not candles:
-        return None, None
-
-    start_ts = candles[0][0]
-    end_ts = candles[-1][0]
-
-    return (
-        datetime.fromtimestamp(start_ts, IST).strftime("%H:%M:%S"),
-        datetime.fromtimestamp(end_ts, IST).strftime("%H:%M:%S"),
-    )
-
-
-def effective_trade_date(requested_date: str | None):
+def market_start_today():
     now = datetime.now(IST)
-
-    if requested_date:
-        base_date = datetime.strptime(requested_date, "%Y-%m-%d")
-    else:
-        base_date = now - timedelta(days=1) if now.time() < MARKET_OPEN else now
-
-    for i in range(MAX_LOOKBACK_DAYS):
-        check_date = (base_date - timedelta(days=i)).strftime("%Y-%m-%d")
-        start_ms, end_ms = market_range_for_date(check_date)
-
-        try:
-            with open(COMPANY_FILE) as f:
-                sample_symbol = json.load(f)[0].split("__")[0].strip()
-
-            candles = fetch_candles(sample_symbol, start_ms, end_ms)
-            if candles:
-                return check_date, i > 0
-        except Exception:
-            pass
-
-    return base_date.strftime("%Y-%m-%d"), True
+    return to_ms(now.replace(hour=9, minute=0, second=0, microsecond=0))
 
 # =====================================================
-# FETCH LOGIC
+# ASYNC FETCH
 # =====================================================
-def fetch_candles(symbol: str, start_ms: int, end_ms: int):
+async def fetch_candles(session, symbol, start_ms, end_ms):
     url = f"{GROWW_URL}/{symbol}"
-
     params = {
         "intervalInMinutes": INTERVAL_MINUTES,
         "startTimeInMillis": start_ms,
         "endTimeInMillis": end_ms,
     }
-
     headers = {
         "accept": "application/json, text/plain, */*",
         "x-app-id": "growwWeb",
@@ -114,118 +62,146 @@ def fetch_candles(symbol: str, start_ms: int, end_ms: int):
         "x-device-type": "charts",
     }
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
-            r.raise_for_status()
-            return r.json().get("candles", [])
-        except Exception:
-            if attempt == MAX_RETRIES:
-                return []
-            time.sleep(1)
+    try:
+        async with session.get(url, params=params, headers=headers, timeout=TIMEOUT) as r:
+            if r.status == 200:
+                data = await r.json()
+                return symbol, data.get("candles", [])
+    except Exception:
+        pass
+
+    return symbol, []
+
+async def fetch_all_candles(symbols, start_ms, end_ms):
+    connector = aiohttp.TCPConnector(limit=MAX_WORKERS)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            fetch_candles(session, s, start_ms, end_ms)
+            for s in symbols
+        ]
+        return await asyncio.gather(*tasks)
 
 # =====================================================
-# HOME
+# SIGNALS FETCH
 # =====================================================
-@app.route("/", methods=["GET"])
+def fetch_signals():
+    import requests
+    try:
+        r = requests.get(SIGNALS_URL, timeout=20)
+        r.raise_for_status()
+        return r.json().get("data", [])
+    except Exception:
+        return []
+
+# =====================================================
+# ANALYSIS LOGIC
+# =====================================================
+def analyze_trade(candles, signal):
+    open_price = signal["open"]
+    target = signal["target"]
+    stoploss = signal["stoploss"]
+
+    entered = False
+    entry_time = None
+
+    for ts, o, h, l, c, v in candles:
+        t = datetime.fromtimestamp(ts, IST).strftime("%H:%M:%S")
+
+        if not entered and h > open_price:
+            entered = True
+            entry_time = t
+
+        if entered:
+            if h >= target:
+                return "EXITED_TARGET", entry_time, t, target
+            if l <= stoploss:
+                return "EXITED_SL", entry_time, t, stoploss
+
+    if entered:
+        return "ENTERED", entry_time, None, None
+
+    return "NOT_ENTERED", None, None, None
+
+# =====================================================
+# ROUTES
+# =====================================================
+@app.route("/")
 def home():
     return jsonify({
         "status": "ok",
-        "message": "Server running fine 🚀",
-        "time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     })
 
-# =====================================================
-# API – SYMBOL LIST
-# =====================================================
-@app.route("/api/symbols", methods=["GET"])
-def get_symbols():
-    try:
-        with open(COMPANY_FILE) as f:
-            companies = json.load(f)
+@app.route("/api/analyze-signals")
+def analyze_signals():
+    start_clock = time.perf_counter()
 
-        symbols = sorted({
-            item.split("__")[0].strip()
-            for item in companies
-            if item and "__" in item
-        })
+    # ---------------------------
+    # Load signals
+    # ---------------------------
+    signals = fetch_signals()
+    signal_map = {s["symbol"]: s for s in signals}
 
-        return jsonify({
-            "status": "ok",
-            "count": len(symbols),
-            "symbols": symbols
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
-
-# =====================================================
-# API – LIVE CANDLES (NEW LOGIC)
-# =====================================================
-@app.route("/api/live-candles", methods=["GET"])
-def live_candles():
-    requested_date = request.args.get("date")
-    latest = request.args.get("latest", "false").lower() == "true"
-
-    fetched_date, is_fallback = effective_trade_date(requested_date)
-    start_ms, end_ms = market_range_for_date(fetched_date)
-
+    # ---------------------------
+    # Load batch symbols
+    # ---------------------------
     with open(COMPANY_FILE) as f:
         companies = json.load(f)
 
-    total_items = len(companies)
-    batch_size = max(1, total_items // TOTAL_BATCHES)
+    symbols = [c.split("__")[0].strip() for c in companies if "__" in c]
 
-    batch_no = min(BATCH_NO, (total_items + batch_size - 1) // batch_size)
-    start_idx = (batch_no - 1) * batch_size
-    end_idx = min(start_idx + batch_size, total_items)
+    total = len(symbols)
+    batch_size = max(1, total // TOTAL_BATCHES)
 
-    batch = companies[start_idx:end_idx]
+    batch_no = min(BATCH_NO, (total + batch_size - 1) // batch_size)
+    start_i = (batch_no - 1) * batch_size
+    end_i = min(start_i + batch_size, total)
+
+    batch_symbols = [s for s in symbols[start_i:end_i] if s in signal_map]
+
+    # ---------------------------
+    # Candle range (last 45 mins)
+    # ---------------------------
+    now = datetime.now(IST)
+    end_ms = to_ms(now)
+    start_ms = to_ms(now - timedelta(minutes=45))
+
+    # ---------------------------
+    # Async candle fetch
+    # ---------------------------
+    candle_results = asyncio.run(
+        fetch_all_candles(batch_symbols, start_ms, end_ms)
+    )
+
     results = {}
 
-    candles_needed = max(1, LATEST_WINDOW_MINUTES // INTERVAL_MINUTES)
+    for sym, candles in candle_results:
+        sig = signal_map[sym]
+        status, entry_t, exit_t, hit = analyze_trade(candles, sig)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                fetch_candles,
-                item.split("__")[0].strip(),
-                start_ms,
-                end_ms
-            ): item.split("__")[0].strip()
-            for item in batch
+        results[sym] = {
+            **sig,
+            "status": status,
+            "entry_time": entry_t,
+            "exit_time": exit_t,
+            "hit": hit
         }
 
-        for future in as_completed(futures):
-            symbol = futures[future]
-            candles = future.result()
-
-            if latest and candles:
-                results[symbol] = candles[-candles_needed:]
-            else:
-                results[symbol] = candles
-
-    all_candles = [c for v in results.values() for c in v]
-    start_time, end_time = candle_time_range(all_candles)
+    elapsed = time.perf_counter() - start_clock
 
     return jsonify({
-        "mode": "latest" if latest else "full",
-        "latest_window_minutes": LATEST_WINDOW_MINUTES if latest else None,
-        "requested_date": requested_date,
-        "fetched_date": fetched_date,
-        "is_fallback": is_fallback,
+        "status": "ok",
         "batch_no": batch_no,
-        "interval_minutes": INTERVAL_MINUTES,
         "count": len(results),
-        "start_time": start_time,
-        "end_time": end_time,
-        "data": results,
+        "response_time": {
+            "seconds": round(elapsed, 3),
+            "milliseconds": int(elapsed * 1000)
+        },
+        "data": results
     })
 
 # =====================================================
 # RUN
 # =====================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    app.run(host="0.0.0.0", port=5000)
