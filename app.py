@@ -41,12 +41,8 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 def to_ms(dt):
     return int(dt.timestamp() * 1000)
 
-def market_start_today():
-    now = datetime.now(IST)
-    return to_ms(now.replace(hour=9, minute=0, second=0, microsecond=0))
-
 # =====================================================
-# ASYNC FETCH
+# ASYNC FETCH (GROWW)
 # =====================================================
 async def fetch_candles(session, symbol, start_ms, end_ms):
     url = f"{GROWW_URL}/{symbol}"
@@ -94,12 +90,13 @@ def fetch_signals():
         return []
 
 # =====================================================
-# ANALYSIS LOGIC
+# ANALYSIS LOGIC (FINAL)
 # =====================================================
 def analyze_trade(candles, signal):
-    open_price = signal["open"]
+    entry = signal["entry"]
     target = signal["target"]
     stoploss = signal["stoploss"]
+    qty = signal["qty"]
 
     entered = False
     entry_time = None
@@ -107,20 +104,57 @@ def analyze_trade(candles, signal):
     for ts, o, h, l, c, v in candles:
         t = datetime.fromtimestamp(ts, IST).strftime("%H:%M:%S")
 
-        if not entered and h > open_price:
+        # ENTRY
+        if not entered and h >= entry:
             entered = True
             entry_time = t
 
+        # EXIT AFTER ENTRY
         if entered:
+            # TARGET HIT → PROFIT
             if h >= target:
-                return "EXITED_TARGET", entry_time, t, target
+                exit_ltp = target
+                pnl = round((exit_ltp - entry) * qty, 2)
+
+                return {
+                    "status": "EXITED_TARGET",
+                    "entry_time": entry_time,
+                    "exit_time": t,
+                    "exit_ltp": exit_ltp,
+                    "pnl": pnl
+                }
+
+            # STOPLOSS HIT → LOSS
             if l <= stoploss:
-                return "EXITED_SL", entry_time, t, stoploss
+                exit_ltp = stoploss
+                pnl = round((exit_ltp - entry) * qty, 2)
 
+                return {
+                    "status": "EXITED_SL",
+                    "entry_time": entry_time,
+                    "exit_time": t,
+                    "exit_ltp": exit_ltp,
+                    "pnl": pnl
+                }
+
+    # STILL OPEN
     if entered:
-        return "ENTERED", entry_time, None, None
+        return {
+            "status": "ENTERED",
+            "entry_time": entry_time,
+            "exit_time": None,
+            "exit_ltp": None,
+            "pnl": None
+        }
 
-    return "NOT_ENTERED", None, None, None
+    # NEVER ENTERED
+    return {
+        "status": "NOT_ENTERED",
+        "entry_time": None,
+        "exit_time": None,
+        "exit_ltp": None,
+        "pnl": None
+    }
 
 # =====================================================
 # ROUTES
@@ -177,14 +211,11 @@ def analyze_signals():
 
     for sym, candles in candle_results:
         sig = signal_map[sym]
-        status, entry_t, exit_t, hit = analyze_trade(candles, sig)
+        analysis = analyze_trade(candles, sig)
 
         results[sym] = {
             **sig,
-            "status": status,
-            "entry_time": entry_t,
-            "exit_time": exit_t,
-            "hit": hit
+            **analysis
         }
 
     elapsed = time.perf_counter() - start_clock
