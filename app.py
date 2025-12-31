@@ -30,7 +30,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 0)
 MARKET_CLOSE = dtime(15, 30)
 
-MAX_LOOKBACK_DAYS = 7   # ⬅ safety limit
+MAX_LOOKBACK_DAYS = 7   # safety limit
 
 # =====================================================
 # FLASK
@@ -53,6 +53,19 @@ def market_range_for_date(date_str: str):
     return to_ms(start), to_ms(end)
 
 
+def candle_time_range(candles):
+    if not candles:
+        return None, None
+
+    start_ts = candles[0][0]
+    end_ts = candles[-1][0]
+
+    return (
+        datetime.fromtimestamp(start_ts / 1000, IST).strftime("%H:%M:%S"),
+        datetime.fromtimestamp(end_ts / 1000, IST).strftime("%H:%M:%S"),
+    )
+
+
 def effective_trade_date(requested_date: str | None):
     """
     Determines the first valid trading date with available data.
@@ -63,7 +76,6 @@ def effective_trade_date(requested_date: str | None):
     if requested_date:
         base_date = datetime.strptime(requested_date, "%Y-%m-%d")
     else:
-        # Before market open → start from yesterday
         if now.time() < MARKET_OPEN:
             base_date = now - timedelta(days=1)
         else:
@@ -73,7 +85,6 @@ def effective_trade_date(requested_date: str | None):
         check_date = (base_date - timedelta(days=i)).strftime("%Y-%m-%d")
         start_ms, end_ms = market_range_for_date(check_date)
 
-        # Try one symbol just to confirm market data exists
         try:
             with open(COMPANY_FILE) as f:
                 sample_symbol = json.load(f)[0].split("__")[0].strip()
@@ -84,7 +95,6 @@ def effective_trade_date(requested_date: str | None):
         except Exception:
             pass
 
-    # Fallback: return base date even if empty
     return base_date.strftime("%Y-%m-%d"), True
 
 # =====================================================
@@ -172,20 +182,17 @@ def live_candles():
             candles = future.result()
 
             if latest:
-                if candles:
-                    ts, o, h, l, c, v = candles[-1]
-                    results[symbol] = {
-                        "time": datetime.fromtimestamp(ts / 1000, IST).strftime("%H:%M:%S"),
-                        "open": o,
-                        "high": h,
-                        "low": l,
-                        "close": c,
-                        "volume": v,
-                    }
-                else:
-                    results[symbol] = None
+                results[symbol] = candles[-4:] if candles else []
             else:
                 results[symbol] = candles
+
+    # derive overall candle time range
+    all_candles = []
+    for v in results.values():
+        if isinstance(v, list) and v:
+            all_candles.extend(v)
+
+    start_time, end_time = candle_time_range(all_candles)
 
     return jsonify({
         "mode": "latest" if latest else "full",
@@ -195,6 +202,8 @@ def live_candles():
         "batch_no": batch_no,
         "interval_minutes": INTERVAL_MINUTES,
         "count": len(results),
+        "start_time": start_time,
+        "end_time": end_time,
         "data": results,
     })
 
