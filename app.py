@@ -111,7 +111,7 @@ def analyze_trade(candles, signal):
 
         # EXIT AFTER ENTRY
         if entered:
-            # TARGET HIT → PROFIT
+            # TARGET HIT
             if h >= target:
                 exit_ltp = target
                 pnl = round((exit_ltp - entry) * qty, 2)
@@ -124,7 +124,7 @@ def analyze_trade(candles, signal):
                     "pnl": pnl
                 }
 
-            # STOPLOSS HIT → LOSS
+            # STOPLOSS HIT
             if l <= stoploss:
                 exit_ltp = stoploss
                 pnl = round((exit_ltp - entry) * qty, 2)
@@ -209,9 +209,33 @@ def analyze_signals():
 
     results = {}
 
+    # ✅ SUMMARY COUNTS
+    summary = {
+        "entered": 0,
+        "target_hit": 0,
+        "stoploss_hit": 0,
+        "not_entered": 0
+    }
+
     for sym, candles in candle_results:
         sig = signal_map[sym]
         analysis = analyze_trade(candles, sig)
+        status = analysis["status"]
+
+        # COUNT LOGIC
+        if status == "EXITED_TARGET":
+            summary["entered"] += 1
+            summary["target_hit"] += 1
+
+        elif status == "EXITED_SL":
+            summary["entered"] += 1
+            summary["stoploss_hit"] += 1
+
+        elif status == "ENTERED":
+            summary["entered"] += 1
+
+        elif status == "NOT_ENTERED":
+            summary["not_entered"] += 1
 
         results[sym] = {
             **sig,
@@ -224,6 +248,7 @@ def analyze_signals():
         "status": "ok",
         "batch_no": batch_no,
         "count": len(results),
+        "summary": summary,   # ✅ ADDED
         "response_time": {
             "seconds": round(elapsed, 3),
             "milliseconds": int(elapsed * 1000)
