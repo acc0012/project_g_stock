@@ -18,7 +18,9 @@ GROWW_URL = (
     "delayed/exchange/NSE/segment/CASH"
 )
 
-INTERVAL_MINUTES = 3
+INTERVAL_MINUTES = 3          # candle interval from Groww
+LATEST_WINDOW_MINUTES = 5     # 👈 NEW LOGIC: last 5 minutes
+
 MAX_WORKERS = 100
 MAX_RETRIES = 3
 TIMEOUT = 20
@@ -114,12 +116,7 @@ def fetch_candles(symbol: str, start_ms: int, end_ms: int):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=TIMEOUT,
-            )
+            r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
             r.raise_for_status()
             return r.json().get("candles", [])
         except Exception:
@@ -139,7 +136,33 @@ def home():
     })
 
 # =====================================================
-# API
+# API – SYMBOL LIST
+# =====================================================
+@app.route("/api/symbols", methods=["GET"])
+def get_symbols():
+    try:
+        with open(COMPANY_FILE) as f:
+            companies = json.load(f)
+
+        symbols = sorted({
+            item.split("__")[0].strip()
+            for item in companies
+            if item and "__" in item
+        })
+
+        return jsonify({
+            "status": "ok",
+            "count": len(symbols),
+            "symbols": symbols
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+# =====================================================
+# API – LIVE CANDLES (NEW LOGIC)
 # =====================================================
 @app.route("/api/live-candles", methods=["GET"])
 def live_candles():
@@ -162,6 +185,8 @@ def live_candles():
     batch = companies[start_idx:end_idx]
     results = {}
 
+    candles_needed = max(1, LATEST_WINDOW_MINUTES // INTERVAL_MINUTES)
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
@@ -177,18 +202,17 @@ def live_candles():
             symbol = futures[future]
             candles = future.result()
 
-            results[symbol] = candles[-4:] if latest and candles else candles
+            if latest and candles:
+                results[symbol] = candles[-candles_needed:]
+            else:
+                results[symbol] = candles
 
-    # derive overall candle time range
-    all_candles = []
-    for v in results.values():
-        if v:
-            all_candles.extend(v)
-
+    all_candles = [c for v in results.values() for c in v]
     start_time, end_time = candle_time_range(all_candles)
 
     return jsonify({
         "mode": "latest" if latest else "full",
+        "latest_window_minutes": LATEST_WINDOW_MINUTES if latest else None,
         "requested_date": requested_date,
         "fetched_date": fetched_date,
         "is_fallback": is_fallback,
@@ -205,4 +229,3 @@ def live_candles():
 # =====================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, threaded=True)
-    
