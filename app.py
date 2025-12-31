@@ -30,7 +30,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 0)
 MARKET_CLOSE = dtime(15, 30)
 
-MAX_LOOKBACK_DAYS = 7   # safety limit
+MAX_LOOKBACK_DAYS = 7
 
 # =====================================================
 # FLASK
@@ -54,6 +54,9 @@ def market_range_for_date(date_str: str):
 
 
 def candle_time_range(candles):
+    """
+    Groww candle timestamps are in SECONDS
+    """
     if not candles:
         return None, None
 
@@ -61,25 +64,18 @@ def candle_time_range(candles):
     end_ts = candles[-1][0]
 
     return (
-        datetime.fromtimestamp(start_ts / 1000, IST).strftime("%H:%M:%S"),
-        datetime.fromtimestamp(end_ts / 1000, IST).strftime("%H:%M:%S"),
+        datetime.fromtimestamp(start_ts, IST).strftime("%H:%M:%S"),
+        datetime.fromtimestamp(end_ts, IST).strftime("%H:%M:%S"),
     )
 
 
 def effective_trade_date(requested_date: str | None):
-    """
-    Determines the first valid trading date with available data.
-    Falls back over holidays/weekends automatically.
-    """
     now = datetime.now(IST)
 
     if requested_date:
         base_date = datetime.strptime(requested_date, "%Y-%m-%d")
     else:
-        if now.time() < MARKET_OPEN:
-            base_date = now - timedelta(days=1)
-        else:
-            base_date = now
+        base_date = now - timedelta(days=1) if now.time() < MARKET_OPEN else now
 
     for i in range(MAX_LOOKBACK_DAYS):
         check_date = (base_date - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -181,15 +177,12 @@ def live_candles():
             symbol = futures[future]
             candles = future.result()
 
-            if latest:
-                results[symbol] = candles[-4:] if candles else []
-            else:
-                results[symbol] = candles
+            results[symbol] = candles[-4:] if latest and candles else candles
 
     # derive overall candle time range
     all_candles = []
     for v in results.values():
-        if isinstance(v, list) and v:
+        if v:
             all_candles.extend(v)
 
     start_time, end_time = candle_time_range(all_candles)
@@ -212,3 +205,4 @@ def live_candles():
 # =====================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, threaded=True)
+    
